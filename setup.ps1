@@ -161,8 +161,13 @@ if ($env:SKIP_RUST -ne '1') {
     # Real-time scanning of build output slows Rust builds a lot. Opt-in, and admin only.
     if ($env:DEFENDER_EXCLUDE -eq '1') {
         if ($isAdmin) {
-            Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo", "$env:USERPROFILE\.rustup", "$env:USERPROFILE\src"
-            Write-Host "Defender exclusions added: .cargo, .rustup and $env:USERPROFILE\src (clone and build there)."
+            try {
+                Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo", "$env:USERPROFILE\.rustup", "$env:USERPROFILE\src" -ErrorAction Stop
+                Write-Host "Defender exclusions added: .cargo, .rustup and $env:USERPROFILE\src (clone and build there)."
+            } catch {
+                # Some images ship with Defender's management interface removed.
+                $problems += "Defender exclusions were not added: $($_.Exception.Message)"
+            }
         } else {
             $problems += 'DEFENDER_EXCLUDE=1 needs an admin PowerShell; no exclusion was added.'
         }
