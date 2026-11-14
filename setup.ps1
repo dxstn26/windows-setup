@@ -45,9 +45,15 @@ Write-Host "tailcat $($rel.tag_name) -> $exe"
 
 # ---------------------------------------------------------------- stable address (saved key)
 Step 'Server key'
-if ($env:FRESH_KEY -eq '1') { & $exe genkey --delete --key=default 2>$null | Out-Null }
+# tailcat reports on stderr; under 'Stop', Windows PowerShell 5.1 would treat that as a failure.
+$ErrorActionPreference = 'Continue'
+if ($env:FRESH_KEY -eq '1') { & $exe genkey --delete --key=default 2>&1 | Out-Null }
 $have = (& $exe genkey --list 2>&1 | Out-String) -match 'default'
-if (-not $have) { & $exe genkey --key=default --fixed-region 2>&1 | Out-Null }
+if (-not $have) {
+    & $exe genkey --key=default --fixed-region 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "tailcat genkey failed with exit code $LASTEXITCODE" }
+}
+$ErrorActionPreference = 'Stop'
 
 # ---------------------------------------------------------------- launcher (auto-restart) + autostart
 Step 'Autostart'
