@@ -1,90 +1,99 @@
-# windows-setup: bootstrap a fresh Windows box for remote control over Tailscale + OpenSSH.
+# windows-setup: one paste on a fresh Windows box -> SSH in from the Mac over tailcat.
 #
-#   $env:TSKEY='tskey-auth-...'; irm https://raw.githubusercontent.com/dxstn26/windows-setup/main/setup.ps1 | iex
+#   irm https://raw.githubusercontent.com/dxstn26/windows-setup/main/setup.ps1 | iex
 #
-# Run in an ADMIN PowerShell. TSKEY is optional (without it, a login URL is printed).
-# Env knobs: TSKEY, TS_HOSTNAME, GH_KEYS_USER (default dxstn26), SKIP_SCOOP=1
+# No admin, no account, no auth key, no OpenSSH install: tailcat (github.com/tailscale/tailcat)
+# runs a userspace WireGuard tunnel + built-in SSH server, outbound-only (works behind NAT).
+# Env knobs: GH_KEYS_USER (default dxstn26), SKIP_SCOOP=1, FRESH_KEY=1 (rotate the address)
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $ProgressPreference = 'SilentlyContinue'
-
 function Step($m) { Write-Host "`n==> $m" -ForegroundColor Cyan }
 
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) { throw 'Run this in an elevated (Administrator) PowerShell.' }
-
 $keysUser = if ($env:GH_KEYS_USER) { $env:GH_KEYS_USER } else { 'dxstn26' }
-$tmp = Join-Path $env:TEMP 'windows-setup'
-New-Item -ItemType Directory -Force $tmp | Out-Null
+$dir = Join-Path $env:LOCALAPPDATA 'tailcat'
+$exe = Join-Path $dir 'tailcat.exe'
+$log = Join-Path $dir 'serve.log'
+$run = Join-Path $dir 'run.ps1'
+New-Item -ItemType Directory -Force $dir | Out-Null
 
-# ---------------------------------------------------------------- OpenSSH server
-Step 'OpenSSH Server'
-if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
-    try {
-        Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0' | Out-Null
-    } catch { Write-Host "Windows capability failed ($($_.Exception.Message)); using GitHub MSI" }
+# ---------------------------------------------------------------- stop old instance
+Get-CimInstance Win32_Process -Filter "Name='tailcat.exe'" -ErrorAction SilentlyContinue |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like '*tailcat\run.ps1*' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep 1
+
+# ---------------------------------------------------------------- install tailcat
+Step 'Installing tailcat'
+$arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
+$rel = Invoke-RestMethod 'https://api.github.com/repos/tailscale/tailcat/releases/latest' -Headers @{ 'User-Agent' = 'windows-setup' }
+$asset = $rel.assets | Where-Object name -like "tailcat_*_windows_$arch.zip" | Select-Object -First 1
+if (-not $asset) { throw "No Windows $arch build in release $($rel.tag_name)" }
+$zip = Join-Path $env:TEMP $asset.name
+Invoke-WebRequest $asset.browser_download_url -OutFile $zip
+Expand-Archive $zip -DestinationPath $dir -Force
+Remove-Item $zip -Force
+if (-not (Test-Path $exe)) { $exe = (Get-ChildItem $dir -Recurse -Filter tailcat.exe | Select-Object -First 1).FullName }
+Write-Host "tailcat $($rel.tag_name) -> $exe"
+
+# ---------------------------------------------------------------- stable address (saved key)
+Step 'Server key'
+if ($env:FRESH_KEY -eq '1') { & $exe genkey --delete --key=default 2>$null | Out-Null }
+$have = (& $exe genkey --list 2>&1 | Out-String) -match 'default'
+if (-not $have) { & $exe genkey --key=default --fixed-region 2>&1 | Out-Null }
+
+# ---------------------------------------------------------------- launcher (auto-restart) + autostart
+Step 'Autostart'
+@"
+`$ErrorActionPreference = 'Continue'
+while (`$true) {
+    & '$exe' serve --ssh-authorized-keys=$keysUser@github ssh 2> '$log'
+    Start-Sleep 5
 }
-if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
-    $rel = Invoke-RestMethod 'https://api.github.com/repos/PowerShell/Win32-OpenSSH/releases/latest' -Headers @{ 'User-Agent' = 'windows-setup' }
-    $asset = $rel.assets | Where-Object name -like 'OpenSSH-Win64-*.msi' | Select-Object -First 1
-    $msi = Join-Path $tmp $asset.name
-    Invoke-WebRequest $asset.browser_download_url -OutFile $msi
-    Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn" -Wait
-    $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+"@ | Set-Content -Path $run -Encoding UTF8
+
+$psArgs = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$run`""
+try {
+    $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $psArgs
+    $trg = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+    $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable
+    Register-ScheduledTask -TaskName 'tailcat-ssh' -Action $act -Trigger $trg -Settings $set -Force | Out-Null
+    Write-Host 'Scheduled task tailcat-ssh registered (runs at logon).'
+} catch {
+    Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'tailcat-ssh' -Value "powershell.exe $psArgs"
+    Write-Host 'Scheduled task unavailable; added HKCU Run entry instead.'
 }
-Set-Service sshd -StartupType Automatic
-Start-Service sshd
 
-# Default shell = PowerShell
-$ps = (Get-Command powershell.exe).Source
-New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' -Force | Out-Null
-New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -Value $ps -PropertyType String -Force | Out-Null
+Remove-Item $log -ErrorAction SilentlyContinue
+Start-Process powershell.exe -ArgumentList $psArgs -WindowStyle Hidden
 
-# Firewall: only reachable from the tailnet (CGNAT range), not the public internet
-Get-NetFirewallRule -Name 'sshd-tailnet' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue | Disable-NetFirewallRule
-New-NetFirewallRule -Name 'sshd-tailnet' -DisplayName 'OpenSSH (Tailscale only)' -Direction Inbound `
-    -Protocol TCP -LocalPort 22 -Action Allow -RemoteAddress '100.64.0.0/10' -Profile Any | Out-Null
-
-# Authorized keys: pulled from github.com/<user>.keys (admin accounts use administrators_authorized_keys)
-Step "Authorizing SSH keys from github.com/$keysUser.keys"
-$keys = (Invoke-RestMethod "https://github.com/$keysUser.keys").Trim()
-if (-not $keys) { throw "No public keys found for $keysUser" }
-$akf = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
-New-Item -ItemType Directory -Force (Split-Path $akf) | Out-Null
-[IO.File]::WriteAllText($akf, $keys + "`n", (New-Object Text.UTF8Encoding $false))
-icacls.exe $akf /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
-
-# ---------------------------------------------------------------- Tailscale
-Step 'Tailscale'
-$tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-if (-not (Test-Path $tsExe)) {
-    $msi = Join-Path $tmp 'tailscale.msi'
-    Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
-    Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn TS_NOLAUNCH=1" -Wait
-}
-Start-Service Tailscale -ErrorAction SilentlyContinue
-$hn = if ($env:TS_HOSTNAME) { $env:TS_HOSTNAME } else { ('win-' + $env:COMPUTERNAME).ToLower() }
-$upArgs = @('up', '--unattended', "--hostname=$hn", '--accept-routes=false')
-if ($env:TSKEY) { $upArgs += "--authkey=$($env:TSKEY)" }
-Write-Host ($(if ($env:TSKEY) { 'Joining tailnet with auth key...' } else { 'No TSKEY set: open the login URL below on any device.' }))
-& $tsExe @upArgs
-$ip = (& $tsExe ip -4 | Select-Object -First 1)
-
-# ---------------------------------------------------------------- Scoop + git
+# ---------------------------------------------------------------- scoop + git (optional)
 if ($env:SKIP_SCOOP -ne '1') {
     Step 'Scoop + git'
-    $scoopShim = Join-Path $env:USERPROFILE 'scoop\shims\scoop.ps1'
-    if (-not (Test-Path $scoopShim)) {
-        Invoke-Expression "& {$(Invoke-RestMethod https://get.scoop.sh)} -RunAsAdmin"
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not (Test-Path (Join-Path $env:USERPROFILE 'scoop\shims\scoop.ps1'))) {
+        $extra = if ($isAdmin) { ' -RunAsAdmin' } else { '' }
+        Invoke-Expression "& {$(Invoke-RestMethod https://get.scoop.sh)}$extra"
     }
     $env:Path += ";$env:USERPROFILE\scoop\shims"
     scoop install git 7zip
 }
 
-Step 'Done'
-Write-Host "Host : $hn"
-Write-Host "IP   : $ip"
-Write-Host "User : $env:USERNAME"
-Write-Host "From the Mac:  ssh $env:USERNAME@$hn   (or $ip)" -ForegroundColor Green
+# ---------------------------------------------------------------- show address
+Step 'Waiting for tailcat address'
+$addr = $null
+for ($i = 0; $i -lt 30 -and -not $addr; $i++) {
+    Start-Sleep 1
+    if (Test-Path $log) {
+        $m = [regex]::Match((Get-Content $log -Raw -ErrorAction SilentlyContinue), 'tc[A-Za-z0-9_-]{20,}')
+        if ($m.Success) { $addr = $m.Value }
+    }
+}
+if (-not $addr) { Write-Host "No address yet; check $log" -ForegroundColor Yellow; return }
+Write-Host "`nUser    : $env:USERNAME"
+Write-Host "Address : $addr"
+Write-Host "`nFrom the Mac:" -ForegroundColor Green
+Write-Host "  tailcat ssh $env:USERNAME@$addr" -ForegroundColor Green

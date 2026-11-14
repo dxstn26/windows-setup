@@ -1,32 +1,49 @@
 # windows-setup
 
-One-paste bootstrap for fresh cloud Windows PCs: OpenSSH server + Tailscale + Scoop + git, so you can SSH in from the Mac over the tailnet.
+One-paste bootstrap for fresh cloud Windows PCs so you can SSH in from the Mac using [tailcat](https://github.com/tailscale/tailcat) (Tailscale's WireGuard + NAT traversal, no account, no control plane).
 
-## Use (admin PowerShell on the Windows box)
+## On the Windows box (PowerShell, admin NOT required)
 
 ```powershell
-$env:TSKEY='tskey-auth-XXXX'; irm https://raw.githubusercontent.com/dxstn26/windows-setup/main/setup.ps1 | iex
+irm https://raw.githubusercontent.com/dxstn26/windows-setup/main/setup.ps1 | iex
 ```
 
-From **cmd** (admin):
+From **cmd**:
 
 ```cmd
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:TSKEY='tskey-auth-XXXX'; irm https://raw.githubusercontent.com/dxstn26/windows-setup/main/setup.ps1 | iex"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/dxstn26/windows-setup/main/setup.ps1 | iex"
 ```
 
-Then on the Mac: `ssh <windows-user>@win-<computername>` (printed at the end).
+It prints a line like `tailcat ssh <user>@tcXXXX...`.
 
-## Auth key
+## On the Mac (one time)
 
-Never commit it; this repo is public. Create a reusable, pre-approved, ephemeral key at
-<https://login.tailscale.com/admin/settings/keys> and paste it only in the command. Omit `TSKEY` to get a login URL instead.
+```sh
+brew install tailcat
+```
 
-## What it does
+`~/.ssh/config` (already set up on this Mac) so ssh offers the right key:
 
-- Installs OpenSSH Server (Windows capability, falls back to the Win32-OpenSSH MSI), PowerShell as default shell.
-- Firewall: port 22 allowed only from the Tailscale range `100.64.0.0/10`.
-- Authorizes the public keys from `github.com/dxstn26.keys` (override with `$env:GH_KEYS_USER`).
-- Installs Tailscale and joins with `--unattended` (survives logout/reboot), hostname `win-<computername>`.
-- Installs Scoop, then `git` and `7zip` (skip with `$env:SKIP_SCOOP='1'`).
+```
+Host tc* tailcat-*
+    IdentityFile ~/.ssh/id_ed25519_github_dxstn26
+    IdentitiesOnly yes
+    StrictHostKeyChecking accept-new
+```
 
-Re-running is safe.
+Then paste the printed command: `tailcat ssh <user>@<tc-address>`.
+
+## What the script does
+
+- Downloads the latest tailcat Windows build to `%LOCALAPPDATA%\tailcat` (no installer, no admin).
+- Creates a saved server key, so the address stays the same across reboots/restarts.
+- Runs `tailcat serve --ssh-authorized-keys=dxstn26@github ssh` hidden, auto-restarting, and registers it to start at logon (scheduled task, falling back to the HKCU Run key). Only keys from `github.com/dxstn26.keys` can log in.
+- Installs Scoop + `git` + `7zip` (skip with `$env:SKIP_SCOOP='1'`).
+
+Knobs: `GH_KEYS_USER`, `SKIP_SCOOP=1`, `FRESH_KEY=1` (rotate the address).
+
+## Notes
+
+- Outbound-only: nothing listens on the public internet. The tailcat address embeds a pre-shared key, so treat it as a secret (don't publish it). SSH still requires your key either way.
+- Tailcat's SSH server is built in (PowerShell/cmd shell as the logged-in user), so OpenSSH is not needed.
+- The Windows user must stay logged in (cloud PCs usually auto-logon) because the task runs at logon.
