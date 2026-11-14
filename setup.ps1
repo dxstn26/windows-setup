@@ -4,7 +4,11 @@
 #
 # No admin, no account, no auth key, no OpenSSH install: tailcat (github.com/tailscale/tailcat)
 # runs a userspace WireGuard tunnel + built-in SSH server, outbound-only (works behind NAT).
-# Env knobs: GH_KEYS_USER (default dxstn26), SKIP_SCOOP=1, SKIP_RUST=1, FRESH_KEY=1 (rotate the address)
+# Env knobs: GH_KEYS_USER (default dxstn26), FRESH_KEY=1 (rotate the address),
+#            SKIP_SCOOP=1, SKIP_RUST=1, SKIP_BEVY=1 (no starter project),
+#            DEFENDER_EXCLUDE=1 (admin only: keep Defender out of the Rust folders)
+# Run it in an admin PowerShell if the box has no MSVC Build Tools: Rust cannot link without them.
+# Undo everything with cleanup.ps1.
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -88,22 +92,27 @@ Write-Host "`nFrom the Mac:" -ForegroundColor Green
 Write-Host "  tailcat ssh $env:USERNAME@$addr" -ForegroundColor Green
 }
 
-# ---------------------------------------------------------------- scoop + git (optional)
+# From here on the tools are native programs that write normal progress to stderr.
+# Under 'Stop', Windows PowerShell 5.1 turns that into a terminating error, so check exit codes instead.
+$ErrorActionPreference = 'Continue'
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$problems = @()
+
+# ---------------------------------------------------------------- scoop + git + gh (optional)
 if ($env:SKIP_SCOOP -ne '1') {
-    Step 'Scoop + git'
-    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    Step 'Scoop + git + gh'
     if (-not (Test-Path (Join-Path $env:USERPROFILE 'scoop\shims\scoop.ps1'))) {
         $extra = if ($isAdmin) { ' -RunAsAdmin' } else { '' }
         Invoke-Expression "& {$(Invoke-RestMethod https://get.scoop.sh)}$extra"
     }
     $env:Path += ";$env:USERPROFILE\scoop\shims"
-    scoop install git 7zip
+    scoop install git 7zip gh
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { $problems += 'git did not install (scoop)' }
 }
 
 # ---------------------------------------------------------------- Rust + Bevy (optional, slow: runs after the address is shown)
 if ($env:SKIP_RUST -ne '1') {
     Step 'Rust (rustup) + Bevy prerequisites'
-    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     # MSVC linker (Bevy needs it on the default msvc toolchain)
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
     $hasVC = (Test-Path $vswhere) -and (& $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
@@ -111,27 +120,52 @@ if ($env:SKIP_RUST -ne '1') {
         if ($isAdmin) {
             Write-Host 'Installing Visual Studio Build Tools (C++), several GB, takes a while...'
             $bt = Join-Path $env:TEMP 'vs_BuildTools.exe'
-            Invoke-WebRequest 'https://aka.ms/vs/17/release/vs_BuildTools.exe' -OutFile $bt
-            Start-Process $bt -Wait -ArgumentList '--quiet --wait --norestart --nocache --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended'
+            Invoke-WebRequest 'https://aka.ms/vs/17/release/vs_BuildTools.exe' -OutFile $bt -ErrorAction Stop
+            $p = Start-Process $bt -Wait -PassThru -ArgumentList '--quiet --wait --norestart --nocache --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended'
+            # 3010 = installed, restart wanted
+            if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { $problems += "Visual Studio Build Tools installer exited with $($p.ExitCode)" }
         } else {
-            Write-Host 'No MSVC Build Tools and not admin: re-run this in an admin PowerShell to install them (needed to link Bevy).' -ForegroundColor Yellow
+            $problems += 'No MSVC Build Tools and not admin: Rust is installed but cannot link. Re-run this in an admin PowerShell.'
         }
     }
     if (-not (Test-Path "$env:USERPROFILE\.cargo\bin\rustup.exe")) {
+        $rustArch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
         $ri = Join-Path $env:TEMP 'rustup-init.exe'
-        Invoke-WebRequest 'https://win.rustup.rs/x86_64' -OutFile $ri
+        Invoke-WebRequest "https://win.rustup.rs/$rustArch" -OutFile $ri -ErrorAction Stop
         & $ri -y --default-toolchain stable --profile minimal
+        if ($LASTEXITCODE -ne 0) { $problems += "rustup-init exited with $LASTEXITCODE" }
     }
     $env:Path += ";$env:USERPROFILE\.cargo\bin"
-    rustup component add clippy rustfmt 2>&1 | Out-Null
+    rustup component add clippy rustfmt
+    if ($LASTEXITCODE -ne 0) { $problems += 'rustup could not add clippy and rustfmt' }
+
+    # Real-time scanning of build output slows Rust builds a lot. Opt-in, and admin only.
+    if ($env:DEFENDER_EXCLUDE -eq '1') {
+        if ($isAdmin) {
+            Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo", "$env:USERPROFILE\.rustup", "$env:USERPROFILE\src"
+            Write-Host "Defender exclusions added: .cargo, .rustup and $env:USERPROFILE\src (clone and build there)."
+        } else {
+            $problems += 'DEFENDER_EXCLUDE=1 needs an admin PowerShell; no exclusion was added.'
+        }
+    }
+
     # Bevy starter project, dependencies prefetched (first build is slow; dynamic_linking speeds up dev rebuilds)
     $proj = Join-Path $env:USERPROFILE 'bevy-hello'
-    if (-not (Test-Path $proj)) {
-        cargo new $proj --bin 2>&1 | Out-Null
+    if ($env:SKIP_BEVY -ne '1' -and -not (Test-Path $proj)) {
+        cargo new $proj --bin
         Push-Location $proj
-        cargo add bevy --features dynamic_linking 2>&1 | Out-Null
-        cargo fetch 2>&1 | Out-Null
+        cargo add bevy --features dynamic_linking
+        cargo fetch
         Pop-Location
+        Write-Host "Bevy starter: $proj  (cd there, then: cargo run)"
     }
-    Write-Host "Rust ready. Bevy starter: $proj  (cd there, then: cargo run)"
+}
+
+# ---------------------------------------------------------------- summary
+Step 'Done'
+if ($addr) { Write-Host "  tailcat ssh $env:USERNAME@$addr" -ForegroundColor Green }
+if ($env:SKIP_SCOOP -ne '1') { Write-Host 'For private repositories, sign in once on this box:  gh auth login   then   gh auth setup-git' }
+if ($problems) {
+    Write-Host "`nNot finished:" -ForegroundColor Yellow
+    $problems | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
 }
