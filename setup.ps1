@@ -20,6 +20,7 @@ $dir = Join-Path $env:LOCALAPPDATA 'tailcat'
 $exe = Join-Path $dir 'tailcat.exe'
 $log = Join-Path $dir 'serve.log'
 $run = Join-Path $dir 'run.ps1'
+$addrFile = Join-Path $dir 'address.txt'
 New-Item -ItemType Directory -Force $dir | Out-Null
 
 # ---------------------------------------------------------------- stop old instance
@@ -59,6 +60,7 @@ $ErrorActionPreference = 'Stop'
 Step 'Autostart'
 @"
 `$ErrorActionPreference = 'Continue'
+`$env:TAILCAT_ADDR_FILE = '$addrFile'
 while (`$true) {
     & '$exe' serve --ssh-authorized-keys=$keysUser@github ssh 2> '$log'
     Start-Sleep 5
@@ -77,7 +79,7 @@ try {
     Write-Host 'Scheduled task unavailable; added HKCU Run entry instead.'
 }
 
-Remove-Item $log -ErrorAction SilentlyContinue
+Remove-Item $log, $addrFile -ErrorAction SilentlyContinue
 Start-Process powershell.exe -ArgumentList $psArgs -WindowStyle Hidden
 
 # ---------------------------------------------------------------- show address
@@ -85,8 +87,12 @@ Step 'Waiting for tailcat address'
 $addr = $null
 for ($i = 0; $i -lt 30 -and -not $addr; $i++) {
     Start-Sleep 1
-    if (Test-Path $log) {
-        $m = [regex]::Match((Get-Content $log -Raw -ErrorAction SilentlyContinue), 'tc[A-Za-z0-9_-]{20,}')
+    # tailcat writes its address to this file; the log is the fallback.
+    if (Test-Path $addrFile) {
+        $addr = "$(Get-Content $addrFile -Raw -ErrorAction SilentlyContinue)".Trim()
+        if (-not $addr) { $addr = $null }
+    } elseif ($i -ge 10 -and (Test-Path $log)) {
+        $m = [regex]::Match("$(Get-Content $log -Raw -ErrorAction SilentlyContinue)", 'tc[A-Za-z0-9_-]{20,}')
         if ($m.Success) { $addr = $m.Value }
     }
 }
@@ -96,6 +102,8 @@ Write-Host "`nUser    : $env:USERNAME"
 Write-Host "Address : $addr"
 Write-Host "`nFrom the Mac:" -ForegroundColor Green
 Write-Host "  tailcat ssh $env:USERNAME@$addr" -ForegroundColor Green
+# The address has look-alike letters; never retype it.
+try { Set-Clipboard "tailcat ssh $env:USERNAME@$addr"; Write-Host '(copied to the clipboard)' } catch {}
 }
 
 # From here on the tools are native programs that write normal progress to stderr.
