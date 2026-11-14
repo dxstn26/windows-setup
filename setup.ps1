@@ -107,6 +107,11 @@ $problems = @()
 # ---------------------------------------------------------------- scoop + git + gh (optional)
 if ($env:SKIP_SCOOP -ne '1') {
     Step 'Scoop + git + gh'
+    # Scoop and its shims are scripts: a fresh Windows refuses to run them until the user's policy allows it.
+    if ((Get-ExecutionPolicy) -notin 'Unrestricted', 'RemoteSigned', 'Bypass') {
+        Set-ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
+        Write-Host 'Execution policy for this user set to RemoteSigned.'
+    }
     if (-not (Test-Path (Join-Path $env:USERPROFILE 'scoop\shims\scoop.ps1'))) {
         $extra = if ($isAdmin) { ' -RunAsAdmin' } else { '' }
         Invoke-Expression "& {$(Invoke-RestMethod https://get.scoop.sh)}$extra"
